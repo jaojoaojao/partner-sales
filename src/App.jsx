@@ -723,8 +723,11 @@ export default function App() {
   const [campaignName, setCampaignName] = useState('');
   const [categories, setCategories] = useState(DEFAULT_PRESETS.partner_sales.categories);
 
-  // Etapa 1 — Inventário YouTube
-  const [cpm, setCpm] = useState(12);
+  // Etapa 1 — Mídia YouTube (modelo de arbitragem: compra a buyCpm, vende a sellCpm)
+  const [inputMode, setInputMode] = useState('pi'); // 'pi' | 'cpm' | 'volume'
+  const [sellCpm, setSellCpm] = useState(12);
+  const [buyCpm, setBuyCpm] = useState(8);
+  const [impressionInput, setImpressionInput] = useState(500000);
 
   // Estados persistentes
   const [presets, setPresets, presetsLoaded] = useStoredState('yt_calc:presets_v1', DEFAULT_PRESETS);
@@ -739,39 +742,49 @@ export default function App() {
   const [showArchitectureModal, setShowArchitectureModal] = useState(false);
   const [newPresetName, setNewPresetName] = useState('');
 
-  // Cálculo principal — useMemo garante atualização em tempo real
-  const result = useMemo(() => calculateBreakdown(grossRevenue, categories), [grossRevenue, categories]);
+  // Etapa 1: resolução dos valores conforme modo de entrada
+  const resolvedPI = useMemo(() => {
+    if (inputMode === 'pi') return grossRevenue;
+    return (impressionInput / 1000) * sellCpm;
+  }, [inputMode, grossRevenue, impressionInput, sellCpm]);
+
+  const resolvedImpressions = useMemo(() => {
+    if (inputMode === 'pi') return sellCpm > 0 ? (grossRevenue / sellCpm) * 1000 : 0;
+    return impressionInput;
+  }, [inputMode, grossRevenue, sellCpm, impressionInput]);
+
+  // Modelo de arbitragem: compramos mídia a buyCpm, vendemos a sellCpm
+  const buyTotal = useMemo(() => (resolvedImpressions / 1000) * buyCpm, [resolvedImpressions, buyCpm]);
+  const grossMargin = useMemo(() => resolvedPI - buyTotal, [resolvedPI, buyTotal]);
+  const spreadPerMil = useMemo(() => sellCpm - buyCpm, [sellCpm, buyCpm]);
+  const spreadPct = useMemo(() => (sellCpm > 0 ? (spreadPerMil / sellCpm) * 100 : 0), [spreadPerMil, sellCpm]);
+
+  // Cálculo principal — cascata aplica sobre a margem bruta (spread), não sobre o PI total
+  const result = useMemo(() => calculateBreakdown(grossMargin, categories), [grossMargin, categories]);
   const insights = useMemo(() => generateInsights(result), [result]);
 
-  // Etapa 1: views é resultado — quantas impressões o PI compra a esse CPM
-  const views = useMemo(() => (cpm > 0 ? (grossRevenue / cpm) * 1000 : 0), [grossRevenue, cpm]);
-  // Inventário = PI inteiro (views × CPM / 1000 = PI — é o que o YouTube recebe pelo media buy)
-  // Mostrado como referência no resultado, não subtraído (as comissões já saem do PI)
-  const inventoryCost = grossRevenue; // alias semântico: o PI É o custo do inventário
-
-  // Crédito ao canal = o que sobra depois de todas as comissões da cascata
+  // Crédito ao canal = o que sobra depois de todas as comissões sobre a margem bruta
   const finalCredit = useMemo(() => result.finalProfit, [result.finalProfit]);
 
   // Calculadora reversa: dado o crédito líquido desejado, qual PI cobrar?
-  // PI = desejado / fator_cascata  (fator_cascata = finalProfit / grossRevenue)
-  // Para cascatas com custos fixos: PI = (desejado + fixos) / (fator_proporcional)
+  // resolvedPI = targetGrossMargin × sellCpm / spreadPerMil
   const [reverseTarget, setReverseTarget] = useStoredState('yt_calc:reverse_target', 0);
   const reversedPI = useMemo(() => {
-    if (!reverseTarget || reverseTarget <= 0 || !grossRevenue) return 0;
+    if (!reverseTarget || reverseTarget <= 0 || !resolvedPI) return 0;
     const fixedCosts = result.breakdown
       .filter(b => b.kind === 'fixed' && b.role !== 'profit')
       .reduce((s, b) => s + b.fixedValue, 0);
-    // fator proporcional = (crédito + custos fixos) / PI corrente
-    const propFactor = grossRevenue > 0
-      ? (result.finalProfit + fixedCosts) / grossRevenue
+    const propFactor = grossMargin > 0
+      ? (result.finalProfit + fixedCosts) / grossMargin
       : 0;
     if (propFactor <= 0) return 0;
-    return (reverseTarget + fixedCosts) / propFactor;
-  }, [reverseTarget, result, grossRevenue]);
+    const targetMargin = (reverseTarget + fixedCosts) / propFactor;
+    return spreadPerMil > 0 ? (targetMargin * sellCpm) / spreadPerMil : 0;
+  }, [reverseTarget, result, grossMargin, resolvedPI, sellCpm, spreadPerMil]);
 
   // Calculadora AdSense vs Venda Direta
   const [adsenseRpm, setAdsenseRpm] = useStoredState('yt_calc:adsense_rpm', 10);
-  const adsenseRevenue = useMemo(() => (views / 1000) * adsenseRpm, [views, adsenseRpm]);
+  const adsenseRevenue = useMemo(() => (resolvedImpressions / 1000) * adsenseRpm, [resolvedImpressions, adsenseRpm]);
   const adsenseDiff = useMemo(() => finalCredit - adsenseRevenue, [finalCredit, adsenseRevenue]);
   const adsenseUpliftPct = useMemo(
     () => (adsenseRevenue > 0 ? (adsenseDiff / adsenseRevenue) * 100 : 0),
@@ -887,28 +900,27 @@ export default function App() {
 
   // Dados para gráficos
   const pieData = useMemo(() => {
-    const data = result.breakdown
+    const data = [];
+    if (buyTotal > 0 && resolvedPI > 0) {
+      data.push({ name: 'Custo da Mídia YouTube', value: buyTotal, percent: (buyTotal / resolvedPI) * 100, color: '#3b82f6' });
+    }
+    result.breakdown
       .filter(b => b.computedAmount > 0)
-      .map(b => ({
+      .forEach(b => data.push({
         name: b.label,
         value: b.computedAmount,
-        percent: b.percentOfGross,
+        percent: resolvedPI > 0 ? (b.computedAmount / resolvedPI) * 100 : 0,
         color: b.color
       }));
     if (result.finalProfit > 0) {
-      data.push({
-        name: 'Lucro Final',
-        value: result.finalProfit,
-        percent: result.finalMargin,
-        color: '#10b981'
-      });
+      data.push({ name: 'Crédito ao Canal', value: result.finalProfit, percent: resolvedPI > 0 ? (result.finalProfit / resolvedPI) * 100 : 0, color: '#10b981' });
     }
     return data;
-  }, [result]);
+  }, [result, buyTotal, resolvedPI]);
 
   const compareData = useMemo(() => {
     const all = [
-      { name: 'Atual', bruto: grossRevenue, lucro: result.finalProfit, margem: result.finalMargin },
+      { name: 'Atual', bruto: resolvedPI, lucro: result.finalProfit, margem: result.finalMargin },
       ...scenarios.map(s => ({
         name: s.name.length > 18 ? s.name.slice(0, 18) + '…' : s.name,
         bruto: s.grossRevenue,
@@ -1005,23 +1017,23 @@ export default function App() {
           {/* KPI Cards */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
             <KPI
-              label="PI Bruto"
-              value={fmtBRL(result.grossRevenue)}
-              sub="Valor total do pedido"
+              label="Receita de Venda"
+              value={fmtBRL(resolvedPI)}
+              sub={`Venda R$${sellCpm}/mil · ${resolvedImpressions >= 1_000_000 ? `${(resolvedImpressions/1_000_000).toFixed(2)}M` : `${(resolvedImpressions/1_000).toFixed(1)}K`} impr.`}
               accent="#ef4444"
               icon={DollarSign}
             />
             <KPI
-              label="Visualizações Entregues"
-              value={views >= 1_000_000 ? `${(views/1_000_000).toFixed(2)}M` : views >= 1_000 ? `${(views/1_000).toFixed(1)}K` : Math.round(views).toLocaleString('pt-BR')}
-              sub={`CPM R$${cpm} · ${fmtBRL(grossRevenue)} de verba`}
+              label="Margem Bruta (Spread)"
+              value={fmtBRL(grossMargin)}
+              sub={`Spread R$${spreadPerMil.toFixed(2)}/mil · ${spreadPct.toFixed(1)}% do PI`}
               accent="#3b82f6"
               icon={Youtube}
             />
             <KPI
               label="Comissões + Impostos"
               value={fmtBRL(result.totalCosts)}
-              sub={`${(result.grossRevenue > 0 ? (result.totalCosts/result.grossRevenue)*100 : 0).toFixed(1)}% do bruto`}
+              sub={`${(grossMargin > 0 ? (result.totalCosts/grossMargin)*100 : 0).toFixed(1)}% da margem bruta`}
               accent="#f97316"
               icon={TrendingDown}
               trend="down"
@@ -1029,7 +1041,7 @@ export default function App() {
             <KPI
               label="Crédito Efetivo ao Canal"
               value={fmtBRL(finalCredit)}
-              sub={`${(result.grossRevenue > 0 ? (finalCredit/result.grossRevenue)*100 : 0).toFixed(1)}% do bruto`}
+              sub={`${(resolvedPI > 0 ? (finalCredit/resolvedPI)*100 : 0).toFixed(1)}% do PI · ${(grossMargin > 0 ? (finalCredit/grossMargin)*100 : 0).toFixed(1)}% da margem`}
               accent={finalCredit > 0 ? '#10b981' : '#ef4444'}
               icon={TrendingUp}
               trend={finalCredit > 0 ? 'up' : 'down'}
@@ -1041,21 +1053,45 @@ export default function App() {
             {/* COLUNA ESQUERDA — Etapa 1 + Etapa 2 + Tabela */}
             <div className="lg:col-span-2 space-y-6">
 
-              {/* ── ETAPA 1: Custo do Inventário ── */}
+              {/* ── ETAPA 1: Configuração da Mídia ── */}
               <Card className="p-5 border-blue-500/20">
                 <div className="flex items-center gap-3 mb-4">
                   <div className="w-7 h-7 rounded-full bg-blue-500/20 text-blue-400 flex items-center justify-center text-xs font-bold flex-shrink-0">1</div>
                   <div>
-                    <div className="text-[11px] uppercase tracking-wider text-neutral-500">Custo do Inventário YouTube</div>
-                    <h2 className="text-base font-semibold text-white">Impressões × CPM</h2>
+                    <div className="text-[11px] uppercase tracking-wider text-neutral-500">Configuração da Mídia</div>
+                    <h2 className="text-base font-semibold text-white">Volume × CPM × PI</h2>
                   </div>
-                  <Badge variant="info" className="ml-auto">R$ {cpm}/mil views</Badge>
+                  <Badge variant={spreadPerMil > 0 ? 'success' : 'danger'} className="ml-auto">
+                    Spread R${spreadPerMil.toFixed(2)}/mil
+                  </Badge>
                 </div>
 
-                {/* PI Bruto + CPM lado a lado */}
-                <div className="grid grid-cols-2 gap-3 mb-4">
-                  <div>
-                    <label className="text-[11px] uppercase tracking-wider text-neutral-500 block mb-1.5">Valor do PI (verba da campanha)</label>
+                {/* Seletor de modo de entrada */}
+                <div className="flex rounded-lg bg-white/[0.03] border border-white/[0.06] p-1 gap-1 mb-4">
+                  {[
+                    { id: 'pi', label: 'Por PI' },
+                    { id: 'cpm', label: 'Por CPM' },
+                    { id: 'volume', label: 'Por Volume' },
+                  ].map(m => (
+                    <button
+                      key={m.id}
+                      onClick={() => setInputMode(m.id)}
+                      className={cn(
+                        'flex-1 h-8 rounded-md text-xs font-medium transition-all',
+                        inputMode === m.id
+                          ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
+                          : 'text-neutral-500 hover:text-neutral-300'
+                      )}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Input principal conforme modo */}
+                {inputMode === 'pi' && (
+                  <div className="mb-4">
+                    <label className="text-[11px] uppercase tracking-wider text-neutral-500 block mb-1.5">Valor do PI (verba do cliente)</label>
                     <div className="relative">
                       <span className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral-500 text-sm font-medium">R$</span>
                       <input
@@ -1076,25 +1112,69 @@ export default function App() {
                       ))}
                     </div>
                   </div>
+                )}
+
+                {(inputMode === 'cpm' || inputMode === 'volume') && (
+                  <div className="mb-4">
+                    <label className="text-[11px] uppercase tracking-wider text-neutral-500 block mb-1.5">
+                      {inputMode === 'cpm' ? 'Volume de Impressões (CPM × impr. → PI)' : 'Volume de Impressões a entregar'}
+                    </label>
+                    <div className="relative">
+                      <input
+                        type="number"
+                        step="10000"
+                        value={impressionInput}
+                        onChange={(e) => setImpressionInput(parseFloat(e.target.value) || 0)}
+                        className="w-full h-12 px-3 bg-white/[0.02] border border-white/[0.06] rounded-xl text-lg font-semibold text-white focus:outline-none focus:border-blue-500/40 transition-all tabular-nums"
+                        style={{ fontFamily: '"JetBrains Mono", monospace' }}
+                      />
+                    </div>
+                    <div className="flex flex-wrap gap-1.5 mt-2">
+                      {[100000, 250000, 500000, 1000000, 2000000].map(v => (
+                        <button key={v} onClick={() => setImpressionInput(v)}
+                          className="text-[10px] px-2 py-0.5 rounded-md bg-white/[0.03] border border-white/[0.06] text-neutral-400 hover:text-white hover:bg-white/[0.06] transition-colors tabular-nums">
+                          {v >= 1000000 ? `${v/1000000}M` : `${v/1000}K`}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* CPM de Venda + CPM de Compra */}
+                <div className="grid grid-cols-2 gap-3 mb-4">
                   <div>
-                    <label className="text-[11px] uppercase tracking-wider text-neutral-500 block mb-1.5">CPM (R$ por mil impressões)</label>
+                    <label className="text-[11px] uppercase tracking-wider text-neutral-500 block mb-1.5">CPM de Venda (cobrado do cliente)</label>
                     <div className="relative">
                       <span className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral-500 text-xs">R$</span>
                       <input
                         type="number"
                         step="0.5"
-                        value={cpm}
-                        onChange={(e) => setCpm(parseFloat(e.target.value) || 0)}
-                        className="w-full h-12 pl-8 pr-3 bg-white/[0.03] border border-white/[0.06] rounded-xl text-lg font-semibold text-white focus:outline-none focus:border-blue-500/40 transition-all tabular-nums"
+                        value={sellCpm}
+                        onChange={(e) => setSellCpm(parseFloat(e.target.value) || 0)}
+                        className="w-full h-12 pl-8 pr-3 bg-white/[0.03] border border-emerald-500/20 rounded-xl text-lg font-semibold text-white focus:outline-none focus:border-emerald-500/40 transition-all tabular-nums"
+                        style={{ fontFamily: '"JetBrains Mono", monospace' }}
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="text-[11px] uppercase tracking-wider text-neutral-500 block mb-1.5">CPM de Compra (custo YouTube)</label>
+                    <div className="relative">
+                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral-500 text-xs">R$</span>
+                      <input
+                        type="number"
+                        step="0.5"
+                        value={buyCpm}
+                        onChange={(e) => setBuyCpm(parseFloat(e.target.value) || 0)}
+                        className="w-full h-12 pl-8 pr-3 bg-white/[0.03] border border-red-500/20 rounded-xl text-lg font-semibold text-white focus:outline-none focus:border-red-500/40 transition-all tabular-nums"
                         style={{ fontFamily: '"JetBrains Mono", monospace' }}
                       />
                     </div>
                   </div>
                 </div>
 
-                {/* Formatos de mídia disponíveis */}
-                <div className="mt-3">
-                  <div className="text-[11px] uppercase tracking-wider text-neutral-500 mb-2">Espaços de mídia disponíveis</div>
+                {/* Formatos de mídia — definem o CPM de compra */}
+                <div className="mb-4">
+                  <div className="text-[11px] uppercase tracking-wider text-neutral-500 mb-2">Espaços de mídia · define CPM de compra</div>
                   <div className="grid grid-cols-2 gap-2">
                     {[
                       { label: 'Bumper', desc: '6s não pulável', cpm: 8 },
@@ -1104,21 +1184,21 @@ export default function App() {
                     ].map((fmt) => (
                       <button
                         key={fmt.label + fmt.cpm}
-                        onClick={() => setCpm(fmt.cpm)}
+                        onClick={() => setBuyCpm(fmt.cpm)}
                         className={cn(
                           'flex items-center justify-between rounded-lg border px-3 py-2.5 text-left transition-all',
-                          cpm === fmt.cpm
+                          buyCpm === fmt.cpm
                             ? 'bg-blue-500/15 border-blue-500/40'
                             : 'bg-white/[0.02] border-white/[0.06] hover:bg-white/[0.05] hover:border-white/[0.12]'
                         )}
                       >
                         <div>
-                          <div className={cn('text-xs font-medium', cpm === fmt.cpm ? 'text-blue-300' : 'text-neutral-200')}>
+                          <div className={cn('text-xs font-medium', buyCpm === fmt.cpm ? 'text-blue-300' : 'text-neutral-200')}>
                             {fmt.label}
                           </div>
                           <div className="text-[10px] text-neutral-500">{fmt.desc}</div>
                         </div>
-                        <div className={cn('text-sm font-bold font-mono tabular-nums', cpm === fmt.cpm ? 'text-blue-300' : 'text-neutral-400')}>
+                        <div className={cn('text-sm font-bold font-mono tabular-nums', buyCpm === fmt.cpm ? 'text-blue-300' : 'text-neutral-400')}>
                           R${fmt.cpm}
                         </div>
                       </button>
@@ -1126,27 +1206,38 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Resultado Etapa 1 — views é o OUTPUT */}
-                <div className="rounded-lg bg-blue-500/[0.06] border border-blue-500/20 p-4">
-                  <div className="text-[10px] uppercase tracking-wider text-neutral-500 mb-2">Resultado · Alcance da campanha</div>
-                  <div className="flex items-end justify-between">
-                    <div className="text-sm text-neutral-400 leading-relaxed">
-                      <span className="font-mono text-white tabular-nums">{fmtBRL(grossRevenue)}</span>
-                      <span className="mx-1.5">÷</span>
-                      <span className="font-mono text-white tabular-nums">R${cpm}</span>
-                      <span className="mx-1.5">× 1.000 =</span>
-                    </div>
-                    <div className="text-right">
-                      <div className="text-2xl font-bold text-blue-300 font-mono tabular-nums">
-                        {views >= 1_000_000
-                          ? `${(views / 1_000_000).toFixed(2)}M`
-                          : views >= 1_000
-                          ? `${(views / 1_000).toFixed(1)}K`
-                          : Math.round(views).toLocaleString('pt-BR')}
-                      </div>
-                      <div className="text-[10px] text-neutral-500">visualizações entregues</div>
-                    </div>
+                {/* Resultado Etapa 1 — 3 métricas */}
+                <div className="grid grid-cols-3 gap-2 mb-2">
+                  <div className="rounded-lg bg-white/[0.03] border border-white/[0.06] p-3 text-center">
+                    <div className="text-[10px] uppercase tracking-wider text-neutral-500 mb-1">Receita de Venda</div>
+                    <div className="text-sm font-bold font-mono text-white tabular-nums">{fmtBRL(resolvedPI)}</div>
                   </div>
+                  <div className="rounded-lg bg-red-500/[0.06] border border-red-500/20 p-3 text-center">
+                    <div className="text-[10px] uppercase tracking-wider text-neutral-500 mb-1">Custo da Mídia</div>
+                    <div className="text-sm font-bold font-mono text-red-400 tabular-nums">- {fmtBRL(buyTotal)}</div>
+                  </div>
+                  <div className={cn('rounded-lg p-3 text-center border', grossMargin >= 0 ? 'bg-emerald-500/[0.06] border-emerald-500/20' : 'bg-red-500/[0.06] border-red-500/20')}>
+                    <div className="text-[10px] uppercase tracking-wider text-neutral-500 mb-1">Margem Bruta</div>
+                    <div className={cn('text-sm font-bold font-mono tabular-nums', grossMargin >= 0 ? 'text-emerald-400' : 'text-red-400')}>{fmtBRL(grossMargin)}</div>
+                  </div>
+                </div>
+                <div className="rounded-lg bg-white/[0.02] border border-white/[0.05] p-3 flex items-center justify-between">
+                  <span className="text-xs text-neutral-500">
+                    Alcance ·{' '}
+                    <span className="font-mono text-neutral-300 tabular-nums">
+                      {resolvedImpressions >= 1_000_000
+                        ? `${(resolvedImpressions/1_000_000).toFixed(2)}M`
+                        : resolvedImpressions >= 1_000
+                        ? `${(resolvedImpressions/1_000).toFixed(1)}K`
+                        : Math.round(resolvedImpressions).toLocaleString('pt-BR')}
+                    </span>{' '}
+                    impressões
+                  </span>
+                  <span className="text-xs text-neutral-500">
+                    Spread{' '}
+                    <span className="font-mono text-emerald-400 tabular-nums">R${spreadPerMil.toFixed(2)}/mil</span>
+                    <span className="ml-1 text-neutral-600">({spreadPct.toFixed(1)}%)</span>
+                  </span>
                 </div>
               </Card>
 
@@ -1168,10 +1259,13 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Vínculo explícito com o PI */}
+                {/* Vínculo explícito com a margem bruta */}
                 <div className="flex items-center justify-between text-xs rounded-md bg-white/[0.02] border border-white/[0.05] px-3 py-2 mb-3">
-                  <span className="text-neutral-500">Aplicando sobre o PI da Etapa 1</span>
-                  <span className="font-mono font-semibold text-white tabular-nums">{fmtBRL(grossRevenue)}</span>
+                  <span className="text-neutral-500">Aplicando sobre a Margem Bruta (spread) da Etapa 1</span>
+                  <div className="text-right">
+                    <span className="font-mono font-semibold text-white tabular-nums">{fmtBRL(grossMargin)}</span>
+                    <span className="text-neutral-600 ml-2">({spreadPct.toFixed(1)}% do PI)</span>
+                  </div>
                 </div>
 
                 <div className="text-[11px] text-neutral-500 mb-3 flex items-center gap-2 bg-amber-500/[0.04] border border-amber-500/[0.1] rounded-md p-2">
@@ -1223,43 +1317,57 @@ export default function App() {
                   </div>
                 </div>
                 <div className="space-y-1.5 text-sm font-mono">
-                  {/* PI Bruto */}
+                  {/* Receita de venda */}
                   <div className="flex justify-between items-center py-2 border-b border-white/[0.06]">
-                    <span className="text-neutral-300 font-sans font-medium">PI Bruto</span>
-                    <span className="text-white tabular-nums">{fmtBRL(grossRevenue)}</span>
+                    <span className="text-neutral-300 font-sans font-medium">Receita de Venda (PI)</span>
+                    <span className="text-white tabular-nums">{fmtBRL(resolvedPI)}</span>
                   </div>
-                  {/* Custo do inventário YouTube */}
-                  <div className="flex justify-between items-center py-1.5 border-b border-white/[0.04] bg-blue-500/[0.02] px-2 rounded-md">
+                  {/* Custo real da mídia */}
+                  <div className="flex justify-between items-center py-1.5 border-b border-white/[0.04] bg-red-500/[0.02] px-2 rounded-md">
                     <div className="flex items-center gap-2 font-sans min-w-0">
-                      <div className="w-1.5 h-1.5 rounded-full flex-shrink-0 bg-blue-400" />
+                      <div className="w-1.5 h-1.5 rounded-full flex-shrink-0 bg-red-400" />
                       <div className="min-w-0">
-                        <span className="text-neutral-300 text-xs">Custo Inventário YouTube</span>
+                        <span className="text-neutral-300 text-xs">Custo Real da Mídia YouTube</span>
                         <span className="text-neutral-600 text-[10px] ml-1.5 tabular-nums">
-                          {views >= 1_000_000 ? `${(views/1_000_000).toFixed(2)}M` : `${(views/1_000).toFixed(1)}K`} views × R${cpm}/mil
+                          {resolvedImpressions >= 1_000_000 ? `${(resolvedImpressions/1_000_000).toFixed(2)}M` : `${(resolvedImpressions/1_000).toFixed(1)}K`} impr. × R${buyCpm}/mil
                         </span>
                       </div>
                     </div>
-                    <span className="text-blue-400 tabular-nums text-xs flex-shrink-0 ml-2">{fmtBRL(inventoryCost)}</span>
+                    <span className="text-red-400 tabular-nums text-xs flex-shrink-0 ml-2">- {fmtBRL(buyTotal)}</span>
                   </div>
-                  {/* Comissões em cascata */}
+                  {/* Margem bruta = spread */}
+                  <div className="flex justify-between items-center py-1.5 border-b border-white/[0.06] px-2">
+                    <span className="text-neutral-400 font-sans text-xs">= Margem Bruta (spread)</span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-neutral-600 text-[10px] tabular-nums">{spreadPct.toFixed(1)}%</span>
+                      <span className="text-emerald-400 tabular-nums text-sm font-semibold">{fmtBRL(grossMargin)}</span>
+                    </div>
+                  </div>
+                  {/* Comissões em cascata sobre a margem */}
                   {result.breakdown.map(b => (
                     <div key={b.id} className="flex justify-between items-center py-1.5 border-b border-white/[0.03]">
                       <div className="flex items-center gap-2 font-sans text-neutral-400 min-w-0">
                         <div className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: b.color }} />
                         <span className="truncate text-xs">{b.label}</span>
+                        {b.kind === 'percentage' && <span className="text-neutral-600 text-[10px]">{b.percentage}%</span>}
                       </div>
                       <span className="text-red-400 tabular-nums text-xs flex-shrink-0 ml-2">- {fmtBRL(b.computedAmount)}</span>
                     </div>
                   ))}
                   {/* Crédito final */}
                   <div className="flex justify-between items-center py-2.5 rounded-lg bg-emerald-500/[0.06] border border-emerald-500/20 px-3 mt-2">
-                    <span className="text-emerald-300 font-sans font-semibold">= Crédito ao canal</span>
+                    <div>
+                      <span className="text-emerald-300 font-sans font-semibold">= Crédito ao canal</span>
+                      <div className="text-[10px] text-neutral-500 mt-0.5">
+                        Spread R${spreadPerMil.toFixed(2)}/mil · {(grossMargin > 0 ? (finalCredit/grossMargin)*100 : 0).toFixed(1)}% da margem
+                      </div>
+                    </div>
                     <div className="text-right">
                       <div className={cn('text-xl font-bold tabular-nums', finalCredit >= 0 ? 'text-emerald-400' : 'text-red-400')}>
                         {fmtBRL(finalCredit)}
                       </div>
                       <div className="text-[10px] text-neutral-500">
-                        {(result.grossRevenue > 0 ? (finalCredit/result.grossRevenue)*100 : 0).toFixed(1)}% do PI bruto
+                        {(resolvedPI > 0 ? (finalCredit/resolvedPI)*100 : 0).toFixed(1)}% da receita bruta
                       </div>
                     </div>
                   </div>
@@ -1315,20 +1423,20 @@ export default function App() {
                       <div className="text-[10px] uppercase tracking-wider text-neutral-500 mb-1">PI a cobrar do anunciante</div>
                       <div className="text-2xl font-bold text-violet-300 font-mono tabular-nums">{fmtBRL(reversedPI)}</div>
                       <div className="text-[10px] text-neutral-500 mt-1">
-                        {(reverseTarget / reversedPI * 100).toFixed(1)}% do PI · fator cascata: {(result.finalProfit / grossRevenue * 100).toFixed(1)}%
+                        {(reverseTarget / reversedPI * 100).toFixed(1)}% do PI · fator cascata: {(grossMargin > 0 ? result.finalProfit / grossMargin * 100 : 0).toFixed(1)}%
                       </div>
                     </div>
-                    {/* Views correspondentes */}
+                    {/* Impressões correspondentes */}
                     <div className="rounded-lg bg-blue-500/[0.05] border border-blue-500/15 p-3 flex items-center justify-between">
-                      <span className="text-xs text-neutral-400">Views entregues para esse PI</span>
+                      <span className="text-xs text-neutral-400">Impressões entregues para esse PI</span>
                       <span className="font-mono text-blue-300 tabular-nums text-sm font-semibold">
-                        {cpm > 0
+                        {sellCpm > 0
                           ? (() => {
-                              const v = (reversedPI / cpm) * 1000;
+                              const v = (reversedPI / sellCpm) * 1000;
                               return v >= 1_000_000 ? `${(v/1_000_000).toFixed(2)}M` : `${(v/1_000).toFixed(1)}K`;
                             })()
                           : '—'
-                        } views
+                        } impr.
                       </span>
                     </div>
                     {/* Checklist */}
@@ -1382,29 +1490,27 @@ export default function App() {
                     </thead>
                     <tbody className="font-mono text-xs">
                       <tr className="border-t border-white/[0.05] bg-white/[0.015]">
-                        <td className="p-3 font-sans text-white font-semibold">PI Bruto</td>
+                        <td className="p-3 font-sans text-white font-semibold">Receita de Venda (PI)</td>
                         <td className="p-3 text-right text-neutral-600">—</td>
                         <td className="p-3 text-right text-neutral-600">—</td>
-                        <td className="p-3 text-right text-white font-semibold">{fmtBRL(result.grossRevenue)}</td>
-                        <td className="p-3 text-right text-white font-semibold">{fmtBRL(result.grossRevenue)}</td>
+                        <td className="p-3 text-right text-white font-semibold">{fmtBRL(resolvedPI)}</td>
+                        <td className="p-3 text-right text-white font-semibold">{fmtBRL(resolvedPI)}</td>
                         <td className="p-3 text-right text-neutral-400">100.00%</td>
                       </tr>
-                      {/* Etapa 1 row — alcance calculado */}
-                      <tr className="border-t border-white/[0.04] bg-blue-500/[0.03]">
+                      {/* Custo real da mídia */}
+                      <tr className="border-t border-white/[0.04] bg-red-500/[0.02]">
                         <td className="p-3 font-sans">
                           <div className="flex items-center gap-2">
-                            <div className="w-1.5 h-1.5 rounded-full bg-blue-400" />
-                            <span className="text-neutral-200">Alcance (Inventário YouTube)</span>
+                            <div className="w-1.5 h-1.5 rounded-full bg-red-400" />
+                            <span className="text-neutral-200">Custo Real da Mídia YouTube</span>
                             <Badge variant="info" className="text-[9px]">Etapa 1</Badge>
                           </div>
                         </td>
-                        <td className="p-3 text-right text-neutral-500 tabular-nums">{fmtBRL(grossRevenue)}</td>
-                        <td className="p-3 text-right text-neutral-500">÷ R${cpm}/mil</td>
-                        <td className="p-3 text-right text-blue-400 tabular-nums font-mono">
-                          {views >= 1_000_000 ? `${(views/1_000_000).toFixed(2)}M` : `${(views/1_000).toFixed(1)}K`} views
-                        </td>
-                        <td className="p-3 text-right text-neutral-500 tabular-nums">—</td>
-                        <td className="p-3 text-right text-neutral-500 tabular-nums">—</td>
+                        <td className="p-3 text-right text-neutral-500 tabular-nums">{fmtBRL(resolvedPI)}</td>
+                        <td className="p-3 text-right text-neutral-500">R${buyCpm}/R${sellCpm}</td>
+                        <td className="p-3 text-right text-red-400 tabular-nums font-mono">- {fmtBRL(buyTotal)}</td>
+                        <td className="p-3 text-right text-white tabular-nums">{fmtBRL(grossMargin)}</td>
+                        <td className="p-3 text-right text-neutral-500 tabular-nums">{resolvedPI > 0 ? (buyTotal/resolvedPI*100).toFixed(2) : '0.00'}%</td>
                       </tr>
                       {/* Etapa 2 rows */}
                       {result.breakdown.map(b => (
@@ -1434,7 +1540,7 @@ export default function App() {
                           {fmtBRL(finalCredit)}
                         </td>
                         <td className="p-3 text-right tabular-nums font-semibold" style={{ color: finalCredit >= 0 ? '#34d399' : '#f87171' }}>
-                          {(result.grossRevenue > 0 ? (finalCredit/result.grossRevenue)*100 : 0).toFixed(2)}%
+                          {(resolvedPI > 0 ? (finalCredit/resolvedPI)*100 : 0).toFixed(2)}%
                         </td>
                       </tr>
                     </tbody>
@@ -1495,7 +1601,7 @@ export default function App() {
                       key={i}
                       className="h-full transition-all hover:brightness-125 cursor-default"
                       style={{
-                        width: `${(d.value / result.grossRevenue) * 100}%`,
+                        width: `${resolvedPI > 0 ? (d.value / resolvedPI) * 100 : 0}%`,
                         backgroundColor: d.color
                       }}
                       title={`${d.name}: ${fmtBRL(d.value)} (${d.percent.toFixed(1)}%)`}
@@ -1504,7 +1610,7 @@ export default function App() {
                 </div>
                 <div className="flex justify-between mt-2 text-[10px] text-neutral-500 tabular-nums">
                   <span>R$ 0</span>
-                  <span>{fmtBRL(result.grossRevenue)}</span>
+                  <span>{fmtBRL(resolvedPI)}</span>
                 </div>
               </Card>
 
@@ -1534,10 +1640,10 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Views (leitura da Etapa 1) */}
+                {/* Impressões (leitura da Etapa 1) */}
                 <div className="flex items-center justify-between text-xs text-neutral-500 bg-white/[0.02] rounded-md px-3 py-2 mb-3 border border-white/[0.05]">
-                  <span>Visualizações (da Etapa 1)</span>
-                  <span className="font-mono text-neutral-300 tabular-nums">{views.toLocaleString('pt-BR')}</span>
+                  <span>Impressões (da Etapa 1)</span>
+                  <span className="font-mono text-neutral-300 tabular-nums">{resolvedImpressions.toLocaleString('pt-BR')}</span>
                 </div>
 
                 {/* RPM AdSense input */}
